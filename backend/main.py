@@ -1,4 +1,5 @@
 import os
+import time
 from typing import List, Literal
 
 from dotenv import load_dotenv
@@ -16,8 +17,23 @@ SYSTEM_PROMPT = os.getenv(
     "তুমি একজন সহায়ক AI assistant। ব্যবহারকারী যে ভাষায় লেখে, সেই ভাষায় উত্তর দাও।",
 )
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# মূল মডেল ব্যর্থ হলে এই মডেলগুলো ক্রমানুসারে চেষ্টা হবে (কমা দিয়ে আলাদা করুন)
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-flash-latest").split(",")
+    if m.strip()
+]
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+
+RETRIES_PER_MODEL = int(os.getenv("RETRIES_PER_MODEL", "3"))
+RETRY_CODES = {429, 500, 502, 503, 504}  # সাময়িক সমস্যা: আবার চেষ্টা করা হবে
+SWITCH_CODES = {404}  # মডেল নেই: সরাসরি পরের মডেলে যাওয়া হবে
+
+FRIENDLY_ERROR = (
+    "দুঃখিত, এই মুহূর্তে AI সার্ভারে অনেক চাপ। "
+    "কিছুক্ষণ পরে আবার মেসেজ পাঠান।"
+)
 
 app = FastAPI(title="AI Chat Backend")
 
@@ -39,6 +55,15 @@ class ChatRequest(BaseModel):
     messages: List[Message]  # পুরো কথোপকথন (history সহ)
 
 
+class AllModelsFailed(Exception):
+    pass
+
+
+def _error_code(e: Exception):
+    code = getattr(e, "code", None)
+    return code if isinstance(code, int) else None
+
+
 def stream_gemini(messages: List[Message]):
     from google import genai
     from google.genai import types
@@ -51,13 +76,36 @@ def stream_gemini(messages: List[Message]):
         }
         for m in messages
     ]
-    for chunk in client.models.generate_content_stream(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    ):
-        if chunk.text:
-            yield chunk.text
+
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    last_error = None
+
+    for model in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            started = False
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                ):
+                    if chunk.text:
+                        started = True
+                        yield chunk.text
+                return  # সফল
+            except Exception as e:
+                if started:
+                    raise  # উত্তর অর্ধেক চলে গেছে, আবার শুরু করলে লেখা দ্বিগুণ হবে
+                last_error = e
+                code = _error_code(e)
+                if code in RETRY_CODES:
+                    time.sleep(1.5 * (attempt + 1))  # একটু অপেক্ষা করে আবার
+                    continue
+                if code in SWITCH_CODES:
+                    break  # পরের মডেলে যাও
+                raise  # key ভুল, অনুরোধ ভুল ইত্যাদি: আবার চেষ্টা করে লাভ নেই
+
+    raise AllModelsFailed(str(last_error))
 
 
 def stream_claude(messages: List[Message]):
@@ -87,7 +135,11 @@ def chat(req: ChatRequest):
         try:
             source = stream_claude if PROVIDER == "claude" else stream_gemini
             yield from source(req.messages)
-        except Exception as e:  # সহজ error handling
+        except AllModelsFailed as e:
+            print("All models failed:", e)  # Render-এর Logs-এ আসল কারণ দেখা যাবে
+            yield FRIENDLY_ERROR
+        except Exception as e:
+            print("Error:", e)
             yield f"\n[Error: {e}]"
 
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
